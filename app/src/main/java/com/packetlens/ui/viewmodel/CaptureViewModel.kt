@@ -118,7 +118,7 @@ class CaptureViewModel @Inject constructor(
             httpCount = allPackets.count { it.protocol == Protocol.HTTP || it.protocol == Protocol.HTTPS },
             dnsCount = allPackets.count { it.protocol == Protocol.DNS },
             tlsCount = allPackets.count { it.protocol == Protocol.TLS },
-            totalBytes = allPackets.sumOf { it.length }
+            totalBytes = allPackets.sumOf { it.length.toLong() }
         )
     }
 

@@ -9,8 +9,8 @@ import java.nio.ByteBuffer
 object PacketParser {
 
     // Protocol numbers
-    private const val TCP = 6
-    private const val UDP = 17
+    const val TCP = 6
+    const val UDP = 17
 
     data class IpHeader(
         val version: Int,
