@@ -39,6 +39,11 @@ import javax.inject.Inject
  *
  * Key: We use protect() on real sockets so they bypass the VPN tunnel
  * and go directly to the internet, avoiding infinite loops.
+ *
+ * IMPORTANT: When writing raw IP packets to a TUN device, the kernel does NOT
+ * fill in checksums. We must compute IP header checksums, TCP checksums
+ * (with pseudo-header), and UDP checksums ourselves, or the local TCP/IP
+ * stack will silently drop the packets.
  */
 @AndroidEntryPoint
 class CaptureVpnService : VpnService() {
@@ -473,9 +478,96 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ==============================
+    // ============================================================
+    // Checksum calculation helpers
+    // ============================================================
+
+    /**
+     * Compute IP header checksum over the first [length] bytes of [data].
+     *
+     * Algorithm (RFC 1071):
+     *   1. Sum all 16-bit words.
+     *   2. Fold the 32-bit carry back into the lower 16 bits.
+     *   3. Take the one's complement.
+     */
+    private fun computeIpChecksum(data: ByteArray, length: Int): Int {
+        var sum = 0L
+        var i = 0
+        // Sum 16-bit words
+        while (i + 1 < length) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        // If odd byte left over, add it as-is (zero-padded high byte)
+        if (i < length) {
+            sum += (data[i].toInt() and 0xFF) shl 8
+        }
+        // Fold 32-bit sum into 16 bits
+        while (sum shr 16 != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return sum.toInt().inv() and 0xFFFF
+    }
+
+    /**
+     * Compute TCP or UDP checksum including the pseudo-header.
+     *
+     * Pseudo-header (12 bytes):
+     *   src IP (4) + dst IP (4) + zero (1) + protocol (1) + TCP/UDP length (2)
+     *
+     * The transport data starts at [transportOffset] in [fullPacket] and is
+     * [transportLength] bytes long (header + payload). For UDP over IPv4,
+     * a checksum of 0 means "not computed", but we compute it anyway so the
+     * kernel doesn't drop the packet.
+     */
+    private fun computeTransportChecksum(
+        fullPacket: ByteArray,
+        transportOffset: Int,
+        transportLength: Int,
+        srcIp: InetAddress,
+        dstIp: InetAddress,
+        protocol: Int // 6=TCP, 17=UDP
+    ): Int {
+        // Pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + segLen(2)
+        var sum = 0L
+
+        // Add pseudo-header
+        val srcAddr = srcIp.address
+        val dstAddr = dstIp.address
+        for (i in srcAddr.indices step 2) {
+            sum += ((srcAddr[i].toInt() and 0xFF) shl 8) or (srcAddr[i + 1].toInt() and 0xFF)
+        }
+        for (i in dstAddr.indices step 2) {
+            sum += ((dstAddr[i].toInt() and 0xFF) shl 8) or (dstAddr[i + 1].toInt() and 0xFF)
+        }
+        sum += protocol // zero byte + protocol byte as 16-bit word
+        sum += transportLength
+
+        // Add transport header + payload (16-bit words)
+        var i = transportOffset
+        val end = transportOffset + transportLength
+        while (i + 1 < end) {
+            sum += ((fullPacket[i].toInt() and 0xFF) shl 8) or (fullPacket[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        // Odd trailing byte: pad with zero
+        if (i < end) {
+            sum += (fullPacket[i].toInt() and 0xFF) shl 8
+        }
+
+        // Fold carry bits
+        while (sum shr 16 != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return sum.toInt().inv() and 0xFFFF
+    }
+
+    // ============================================================
     // Packet builders (construct IP packets to write back to TUN)
-    // ==============================
+    //
+    // All checksums are computed here — the kernel will NOT fill them
+    // in for packets written to a TUN file descriptor.
+    // ============================================================
 
     private fun buildTcpPacket(
         srcIp: String, srcPort: Int,
@@ -490,7 +582,7 @@ class CaptureVpnService : VpnService() {
 
         val buffer = ByteBuffer.allocate(totalSize)
 
-        // IP Header (20 bytes)
+        // IP Header (20 bytes) — checksum placeholder
         buffer.put(0x45.toByte()) // Version 4, IHL 5
         buffer.put(0x00.toByte()) // DSCP
         buffer.putShort(totalSize.toShort()) // Total length
@@ -498,11 +590,16 @@ class CaptureVpnService : VpnService() {
         buffer.putShort(0x4000.toShort()) // Flags: Don't Fragment
         buffer.put(64.toByte()) // TTL
         buffer.put(6.toByte()) // Protocol: TCP
-        buffer.putShort(0) // Checksum (kernel fills)
+        buffer.putShort(0) // Checksum — computed below
         buffer.put(InetAddress.getByName(srcIp).address)
         buffer.put(InetAddress.getByName(dstIp).address)
 
+        // Compute IP header checksum over the first 20 bytes
+        val ipChecksum = computeIpChecksum(buffer.array(), ipHeaderSize)
+        buffer.putShort(ipHeaderSize + 10, ipChecksum.toShort())
+
         // TCP Header (20 bytes)
+        val tcpStart = ipHeaderSize
         buffer.putShort(srcPort.toShort())
         buffer.putShort(dstPort.toShort())
         buffer.putInt(seqNum.toInt())
@@ -510,13 +607,25 @@ class CaptureVpnService : VpnService() {
         buffer.put(((5 shl 4) or 0).toByte()) // Data offset: 5 words, reserved 0
         buffer.put(flags.toByte())
         buffer.putShort(65535.toShort()) // Window size
-        buffer.putShort(0) // Checksum (kernel fills)
+        buffer.putShort(0) // Checksum — computed below
         buffer.putShort(0) // Urgent pointer
 
         // Payload
         buffer.put(payload)
 
-        return buffer.array()
+        val packet = buffer.array()
+
+        // Compute TCP checksum with pseudo-header
+        val srcAddr = InetAddress.getByName(srcIp)
+        val dstAddr = InetAddress.getByName(dstIp)
+        val tcpLen = tcpHeaderSize + payload.size
+        val tcpChecksum = computeTransportChecksum(
+            packet, tcpStart, tcpLen, srcAddr, dstAddr, 6
+        )
+        packet[tcpStart + 16] = ((tcpChecksum shr 8) and 0xFF).toByte()
+        packet[tcpStart + 17] = (tcpChecksum and 0xFF).toByte()
+
+        return packet
     }
 
     private fun buildTcpDataPacket(
@@ -544,7 +653,7 @@ class CaptureVpnService : VpnService() {
 
         val buffer = ByteBuffer.allocate(totalSize)
 
-        // IP Header
+        // IP Header — checksum placeholder
         buffer.put(0x45.toByte())
         buffer.put(0x00.toByte())
         buffer.putShort(totalSize.toShort())
@@ -552,20 +661,40 @@ class CaptureVpnService : VpnService() {
         buffer.putShort(0x4000.toShort())
         buffer.put(64.toByte())
         buffer.put(17.toByte()) // Protocol: UDP
-        buffer.putShort(0)
+        buffer.putShort(0) // Checksum — computed below
         buffer.put(InetAddress.getByName(srcIp).address)
         buffer.put(InetAddress.getByName(dstIp).address)
 
+        // Compute IP header checksum
+        val ipChecksum = computeIpChecksum(buffer.array(), ipHeaderSize)
+        buffer.putShort(ipHeaderSize + 10, ipChecksum.toShort())
+
         // UDP Header
+        val udpStart = ipHeaderSize
         buffer.putShort(srcPort.toShort())
         buffer.putShort(dstPort.toShort())
         buffer.putShort((udpHeaderSize + payload.size).toShort())
-        buffer.putShort(0) // Checksum (optional for UDP over IPv4)
+        buffer.putShort(0) // Checksum — computed below
 
         // Payload
         buffer.put(payload)
 
-        return buffer.array()
+        val packet = buffer.array()
+
+        // Compute UDP checksum with pseudo-header.
+        // For UDP over IPv4, checksum=0 means "not computed". However,
+        // some kernels (and Android's local stack) may drop zero-checksum
+        // UDP packets. Compute it properly for reliability.
+        val srcAddr = InetAddress.getByName(srcIp)
+        val dstAddr = InetAddress.getByName(dstIp)
+        val udpLen = udpHeaderSize + payload.size
+        val udpChecksum = computeTransportChecksum(
+            packet, udpStart, udpLen, srcAddr, dstAddr, 17
+        )
+        packet[udpStart + 6] = ((udpChecksum shr 8) and 0xFF).toByte()
+        packet[udpStart + 7] = (udpChecksum and 0xFF).toByte()
+
+        return packet
     }
 
     private fun forwardRawPacket(packet: ByteArray, tunOut: FileOutputStream) {

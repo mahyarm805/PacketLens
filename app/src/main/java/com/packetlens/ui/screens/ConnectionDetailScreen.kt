@@ -13,6 +13,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.ui.platform.LocalContext
+import androidx.activity.ComponentActivity
 import com.packetlens.model.CapturedPacket
 import com.packetlens.ui.viewmodel.CaptureViewModel
 
@@ -21,7 +23,9 @@ import com.packetlens.ui.viewmodel.CaptureViewModel
 fun ConnectionDetailScreen(
     packetId: Long,
     onBack: () -> Unit,
-    viewModel: CaptureViewModel = hiltViewModel()
+    viewModel: CaptureViewModel = hiltViewModel(
+        viewModelStoreOwner = LocalContext.current as ComponentActivity
+    )
 ) {
     val packets by viewModel.packets.collectAsState()
     val packet = packets.find { it.id == packetId }
