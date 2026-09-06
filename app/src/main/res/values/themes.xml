@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PacketLens" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#FF2196F3</item>
+        <item name="android:colorPrimaryDark">#FF1976D2</item>
+        <item name="android:colorAccent">#FF03DAC5</item>
+        <item name="android:statusBarColor">#FF0D1117</item>
+    </style>
+</resources>

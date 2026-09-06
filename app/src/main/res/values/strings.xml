@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PacketLens</string>
+    <string name="vpn_notification_channel">Capture Service</string>
+    <string name="vpn_notification_title">PacketLens is capturing</string>
+    <string name="vpn_notification_text">Monitoring network traffic</string>
+</resources>
