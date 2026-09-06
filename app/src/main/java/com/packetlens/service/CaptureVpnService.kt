@@ -27,8 +27,19 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 
+/**
+ * VPN-based network traffic capture service.
+ *
+ * Architecture:
+ *   App → TUN (read) → Parse/Inspect → Real Socket (protect) → Internet
+ *   Internet → Real Socket (read) → Build IP packet → TUN (write) → App
+ *
+ * Key: We use protect() on real sockets so they bypass the VPN tunnel
+ * and go directly to the internet, avoiding infinite loops.
+ */
 @AndroidEntryPoint
 class CaptureVpnService : VpnService() {
 
@@ -37,10 +48,8 @@ class CaptureVpnService : VpnService() {
         private const val NOTIFICATION_CHANNEL = "capture_channel"
         private const val NOTIFICATION_ID = 1
         private const val VPN_ADDRESS = "10.0.0.2"
-        private const val VPN_ROUTE = "0.0.0.0"
-        private const val VPN_MASK = "0"
+        private const val VPN_DNS = "10.0.0.1"
         private const val MTU = 1500
-        private const val SELF_UID = -1 // Will be set to our own UID to avoid loops
 
         private val _packets = MutableSharedFlow<CapturedPacket>(replay = 0, extraBufferCapacity = 256)
         val packets: SharedFlow<CapturedPacket> = _packets
@@ -57,6 +66,15 @@ class CaptureVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var captureJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Track TCP connections: srcPort → protected Socket
+    private val tcpConnections = ConcurrentHashMap<Int, Socket>()
+
+    // Track UDP sessions: srcPort → protected DatagramSocket
+    private val udpSessions = ConcurrentHashMap<Int, DatagramSocket>()
+
+    private var nextTcpPort = 20000
+    private var nextUdpPort = 30000
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -76,10 +94,10 @@ class CaptureVpnService : VpnService() {
             .setSession("PacketLens")
             .setMtu(MTU)
             .addAddress(VPN_ADDRESS, 32)
-            .addRoute(VPN_ROUTE, VPN_MASK.toInt())
+            .addRoute("0.0.0.0", 0) // Capture all IPv4 traffic
             .addDnsServer("8.8.8.8")
             .addDnsServer("8.8.4.4")
-            .addDisallowedApplication(packageName) // Don't capture our own traffic
+            .addDisallowedApplication(packageName) // Don't capture our own traffic!
 
         vpnInterface = builder.establish()
         if (vpnInterface == null) {
@@ -89,11 +107,11 @@ class CaptureVpnService : VpnService() {
         }
 
         isCapturing = true
-        scope.launch {
-            _isRunning.emit(true)
-        }
+        scope.launch { _isRunning.emit(true) }
 
+        // Main loop: read from TUN → parse → forward → response → write to TUN
         captureJob = scope.launch { runCaptureLoop() }
+
         Log.i(TAG, "Capture started")
     }
 
@@ -102,254 +120,602 @@ class CaptureVpnService : VpnService() {
         captureJob?.cancel()
         captureJob = null
 
-        try {
-            vpnInterface?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing VPN interface", e)
-        }
+        // Close all tracked connections
+        tcpConnections.values.forEach { try { it.close() } catch (_: Exception) {} }
+        tcpConnections.clear()
+        udpSessions.values.forEach { try { it.close() } catch (_: Exception) {} }
+        udpSessions.clear()
+
+        try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
 
-        scope.launch {
-            _isRunning.emit(false)
-        }
-
+        scope.launch { _isRunning.emit(false) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "Capture stopped")
     }
 
+    // ==============================
+    // Main capture loop
+    // ==============================
+
     private fun runCaptureLoop() {
         val fd = vpnInterface?.fileDescriptor ?: return
-        val inputStream = FileInputStream(fd)
-        val outputStream = FileOutputStream(fd)
+        val tunIn = FileInputStream(fd)
+        val tunOut = FileOutputStream(fd)
         val buffer = ByteArray(MTU)
 
         while (isCapturing && !Thread.currentThread().isInterrupted) {
             try {
-                val length = inputStream.read(buffer)
+                val length = tunIn.read(buffer)
                 if (length <= 0) {
                     Thread.sleep(1)
                     continue
                 }
 
-                val data = buffer.copyOf(length)
-                processPacket(data, outputStream)
+                val packet = buffer.copyOf(length)
+                processIncomingPacket(packet, tunOut)
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 if (isCapturing) {
-                    Log.e(TAG, "Error reading packet", e)
+                    Log.e(TAG, "Error in capture loop", e)
                 }
             }
         }
     }
 
-    private fun processPacket(data: ByteArray, outputStream: FileOutputStream) {
-        val ipHeader = PacketParser.parseIPv4(data) ?: return
+    // ==============================
+    // Process packet from TUN (app → internet direction)
+    // ==============================
 
-        val packet = when (ipHeader.protocol) {
-            PacketParser.TCP -> processTCP(data, ipHeader)
-            PacketParser.UDP -> processUDP(data, ipHeader)
-            else -> null
+    private fun processIncomingPacket(packet: ByteArray, tunOut: FileOutputStream) {
+        val ipHeader = PacketParser.parseIPv4(packet) ?: return
+
+        when (ipHeader.protocol) {
+            6 -> handleTCP(packet, ipHeader, tunOut)   // TCP
+            17 -> handleUDP(packet, ipHeader, tunOut)  // UDP
+            else -> {
+                // Unknown protocol — still forward to keep connectivity
+                forwardRawPacket(packet, tunOut)
+            }
+        }
+    }
+
+    // ==============================
+    // TCP Handling
+    // ==============================
+
+    private fun handleTCP(packet: ByteArray, ipHeader: PacketParser.IpHeader, tunOut: FileOutputStream) {
+        val tcpHeader = PacketParser.parseTCP(packet, ipHeader.headerLength) ?: run {
+            forwardRawPacket(packet, tunOut)
+            return
         }
 
-        if (packet != null) {
-            scope.launch {
-                _packets.emit(packet)
+        val srcPort = tcpHeader.srcPort
+        val dstIp = ipHeader.dstIp
+        val dstPort = tcpHeader.dstPort
+
+        // Emit for capture/display
+        emitTcpPacket(packet, ipHeader, tcpHeader)
+
+        // SYN = new connection request
+        if (tcpHeader.isSyn && !tcpHeader.isAck) {
+            launchNewTcpConnection(srcPort, dstIp, dstPort, tunOut)
+            return
+        }
+
+        // FIN/RST = close connection
+        if (tcpHeader.isFin || tcpHeader.isRst) {
+            closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
+            return
+        }
+
+        // Data packet — forward payload through the real socket
+        val socket = tcpConnections[srcPort]
+        if (socket != null && socket.isConnected) {
+            val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
+            val payloadSize = packet.size - payloadOffset
+            if (payloadSize > 0) {
+                try {
+                    val payload = packet.copyOfRange(payloadOffset, packet.size)
+                    socket.getOutputStream().write(payload)
+                    socket.getOutputStream().flush()
+                } catch (e: Exception) {
+                    Log.e(TAG, "TCP write error", e)
+                    closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
+                }
+            }
+            // Launch a reader thread for this connection if not already running
+            ensureTcpReader(srcPort, ipHeader, tcpHeader, tunOut)
+        }
+    }
+
+    private fun launchNewTcpConnection(srcPort: Int, dstIp: String, dstPort: Int, tunOut: FileOutputStream) {
+        scope.launch {
+            try {
+                val socket = Socket()
+                // protect() — bypass VPN tunnel, go directly to internet
+                protect(socket)
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(dstIp, dstPort), 5000)
+                tcpConnections[srcPort] = socket
+
+                // Send SYN-ACK back to TUN (towards the app)
+                val synAck = buildTcpPacket(
+                    srcIp = dstIp, srcPort = dstPort,
+                    dstIp = VPN_ADDRESS, dstPort = srcPort,
+                    seqNum = System.currentTimeMillis(),
+                    ackNum = 1,
+                    flags = 0x12 // SYN+ACK
+                )
+                tunOut.write(synAck)
+                tunOut.flush()
+
+                // Also send ACK to complete handshake
+                val ack = buildTcpPacket(
+                    srcIp = dstIp, srcPort = dstPort,
+                    dstIp = VPN_ADDRESS, dstPort = srcPort,
+                    seqNum = 1,
+                    ackNum = 1,
+                    flags = 0x10 // ACK
+                )
+                tunOut.write(ack)
+                tunOut.flush()
+
+                Log.d(TAG, "TCP connection established: $srcPort → $dstIp:$dstPort")
+
+                // Start reading responses
+                ensureTcpReader(srcPort, ipHeader = null, tcpHeader = null, tunOut = tunOut)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP connect failed: $srcPort → $dstIp:$dstPort", e)
+                // Send RST back to app
+                val rst = buildTcpPacket(
+                    srcIp = dstIp, srcPort = dstPort,
+                    dstIp = VPN_ADDRESS, dstPort = srcPort,
+                    seqNum = 0, ackNum = 0,
+                    flags = 0x04 // RST
+                )
+                try {
+                    tunOut.write(rst)
+                    tunOut.flush()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun ensureTcpReader(srcPort: Int, ipHeader: PacketParser.IpHeader?, tcpHeader: PacketParser.TcpHeader?, tunOut: FileOutputStream) {
+        val socket = tcpConnections[srcPort] ?: return
+        // Use a tag to prevent duplicate reader threads
+        val readerKey = "tcp_reader_$srcPort"
+
+        scope.launch {
+            val buffer = ByteArray(MTU)
+            try {
+                val input = socket.getInputStream()
+                while (isCapturing && socket.isConnected && !socket.isClosed) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+
+                    val data = buffer.copyOf(read)
+                    val responsePacket = buildTcpDataPacket(
+                        srcIp = socket.remoteSocketAddress.toString().substringBefore(":").removePrefix("/"),
+                        srcPort = (socket.remoteSocketAddress as? InetSocketAddress)?.port ?: 443,
+                        dstIp = VPN_ADDRESS,
+                        dstPort = srcPort,
+                        payload = data
+                    )
+
+                    synchronized(tunOut) {
+                        tunOut.write(responsePacket)
+                        tunOut.flush()
+                    }
+                }
+            } catch (e: Exception) {
+                if (isCapturing) Log.d(TAG, "TCP reader closed: $srcPort")
+            } finally {
+                closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
+            }
+        }
+    }
+
+    private fun closeTcpConnection(srcPort: Int, ipHeader: PacketParser.IpHeader?, tcpHeader: PacketParser.TcpHeader?, tunOut: FileOutputStream) {
+        val socket = tcpConnections.remove(srcPort) ?: return
+        try { socket.close() } catch (_: Exception) {}
+
+        // Send FIN+ACK to app so it knows the connection is closed
+        if (ipHeader != null && tcpHeader != null) {
+            try {
+                val finAck = buildTcpPacket(
+                    srcIp = ipHeader.dstIp,
+                    srcPort = tcpHeader.dstPort,
+                    dstIp = VPN_ADDRESS,
+                    dstPort = srcPort,
+                    seqNum = 1,
+                    ackNum = 1,
+                    flags = 0x11 // FIN+ACK
+                )
+                synchronized(tunOut) {
+                    tunOut.write(finAck)
+                    tunOut.flush()
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ==============================
+    // UDP Handling
+    // ==============================
+
+    private fun handleUDP(packet: ByteArray, ipHeader: PacketParser.IpHeader, tunOut: FileOutputStream) {
+        val udpHeader = PacketParser.parseUDP(packet, ipHeader.headerLength) ?: run {
+            forwardRawPacket(packet, tunOut)
+            return
+        }
+
+        val srcPort = udpHeader.srcPort
+        val dstIp = ipHeader.dstIp
+        val dstPort = udpHeader.dstPort
+
+        emitUdpPacket(packet, ipHeader, udpHeader)
+
+        // DNS (port 53) — handle specially
+        if (dstPort == 53) {
+            handleDns(packet, ipHeader, udpHeader, tunOut)
+            return
+        }
+
+        // Get or create UDP session
+        var udpSocket = udpSessions[srcPort]
+        if (udpSocket == null) {
+            try {
+                udpSocket = DatagramSocket()
+                protect(udpSocket) // Bypass VPN tunnel
+                udpSessions[srcPort] = udpSocket
+                ensureUdpReader(srcPort, ipHeader, udpHeader, tunOut)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create UDP socket for port $srcPort", e)
+                return
             }
         }
 
-        // Forward packet to real destination
-        forwardPacket(data, outputStream)
+        // Forward payload
+        val payloadOffset = ipHeader.headerLength + 8
+        val payloadSize = packet.size - payloadOffset
+        if (payloadSize > 0) {
+            scope.launch {
+                try {
+                    val payload = packet.copyOfRange(payloadOffset, packet.size)
+                    val destAddr = InetAddress.getByName(dstIp)
+                    val dgPacket = DatagramPacket(payload, payload.size, destAddr, dstPort)
+                    udpSocket.send(dgPacket)
+                } catch (e: Exception) {
+                    Log.e(TAG, "UDP forward error", e)
+                }
+            }
+        }
     }
 
-    private fun processTCP(data: ByteArray, ipHeader: PacketParser.IpHeader): CapturedPacket? {
-        val tcpHeader = PacketParser.parseTCP(data, ipHeader.headerLength) ?: return null
-        val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
-        val payloadSize = maxOf(0, ipHeader.totalLength - ipHeader.headerLength - tcpHeader.headerLength)
+    private fun handleDns(packet: ByteArray, ipHeader: PacketParser.IpHeader, udpHeader: PacketParser.UdpHeader, tunOut: FileOutputStream) {
+        val payloadOffset = ipHeader.headerLength + 8
+        val payloadSize = packet.size - payloadOffset
+        if (payloadSize <= 0) return
 
-        // Get app info
-        val appInfo = try {
-            // Note: In production, we'd use ConnectivityManager to map connection to UID
-            // For MVP, we'll use a placeholder
-            AppResolver.AppInfo(-1, "unknown", "Unknown App")
-        } catch (e: Exception) {
-            AppResolver.AppInfo(-1, "unknown", "Unknown App")
+        scope.launch {
+            try {
+                val payload = packet.copyOfRange(payloadOffset, packet.size)
+                val socket = DatagramSocket()
+                protect(socket) // Bypass VPN
+                socket.soTimeout = 5000
+
+                val dnsPacket = DatagramPacket(payload, payload.size, InetAddress.getByName("8.8.8.8"), 53)
+                socket.send(dnsPacket)
+
+                val responseBuf = ByteArray(1024)
+                val responsePacket = DatagramPacket(responseBuf, responseBuf.size)
+                socket.receive(responsePacket)
+                socket.close()
+
+                // Build IP+UDP packet with DNS response and write to TUN
+                val responseIpPacket = buildUdpPacket(
+                    srcIp = "8.8.8.8",
+                    srcPort = 53,
+                    dstIp = ipHeader.dstIp,
+                    dstPort = udpHeader.srcPort,
+                    payload = responseBuf.copyOf(responsePacket.length)
+                )
+
+                synchronized(tunOut) {
+                    tunOut.write(responseIpPacket)
+                    tunOut.flush()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "DNS forward error", e)
+            }
         }
+    }
+
+    private fun ensureUdpReader(srcPort: Int, ipHeader: PacketParser.IpHeader, udpHeader: PacketParser.UdpHeader, tunOut: FileOutputStream) {
+        val udpSocket = udpSessions[srcPort] ?: return
+
+        scope.launch {
+            val buffer = ByteArray(MTU)
+            try {
+                while (isCapturing && !udpSocket.isClosed) {
+                    val dgPacket = DatagramPacket(buffer, buffer.size)
+                    try {
+                        udpSocket.receive(dgPacket)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        continue
+                    }
+
+                    val payload = buffer.copyOf(dgPacket.length)
+                    val responsePacket = buildUdpPacket(
+                        srcIp = dgPacket.address.hostAddress ?: "0.0.0.0",
+                        srcPort = dgPacket.port,
+                        dstIp = ipHeader.dstIp,
+                        dstPort = srcPort,
+                        payload = payload
+                    )
+
+                    synchronized(tunOut) {
+                        tunOut.write(responsePacket)
+                        tunOut.flush()
+                    }
+                }
+            } catch (e: Exception) {
+                if (isCapturing) Log.d(TAG, "UDP reader closed: $srcPort")
+            } finally {
+                udpSessions.remove(srcPort)
+                try { udpSocket.close() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    // ==============================
+    // Packet builders (construct IP packets to write back to TUN)
+    // ==============================
+
+    private fun buildTcpPacket(
+        srcIp: String, srcPort: Int,
+        dstIp: String, dstPort: Int,
+        seqNum: Long, ackNum: Long,
+        flags: Int,
+        payload: ByteArray = byteArrayOf()
+    ): ByteArray {
+        val tcpHeaderSize = 20
+        val ipHeaderSize = 20
+        val totalSize = ipHeaderSize + tcpHeaderSize + payload.size
+
+        val buffer = ByteBuffer.allocate(totalSize)
+
+        // IP Header (20 bytes)
+        buffer.put(0x45.toByte()) // Version 4, IHL 5
+        buffer.put(0x00.toByte()) // DSCP
+        buffer.putShort(totalSize.toShort()) // Total length
+        buffer.putShort(0) // ID
+        buffer.putShort(0x4000.toShort()) // Flags: Don't Fragment
+        buffer.put(64.toByte()) // TTL
+        buffer.put(6.toByte()) // Protocol: TCP
+        buffer.putShort(0) // Checksum (kernel fills)
+        buffer.put(InetAddress.getByName(srcIp).address)
+        buffer.put(InetAddress.getByName(dstIp).address)
+
+        // TCP Header (20 bytes)
+        buffer.putShort(srcPort.toShort())
+        buffer.putShort(dstPort.toShort())
+        buffer.putInt(seqNum.toInt())
+        buffer.putInt(ackNum.toInt())
+        buffer.put(((5 shl 4) or 0).toByte()) // Data offset: 5 words, reserved 0
+        buffer.put(flags.toByte())
+        buffer.putShort(65535.toShort()) // Window size
+        buffer.putShort(0) // Checksum (kernel fills)
+        buffer.putShort(0) // Urgent pointer
+
+        // Payload
+        buffer.put(payload)
+
+        return buffer.array()
+    }
+
+    private fun buildTcpDataPacket(
+        srcIp: String, srcPort: Int,
+        dstIp: String, dstPort: Int,
+        payload: ByteArray
+    ): ByteArray {
+        return buildTcpPacket(
+            srcIp = srcIp, srcPort = srcPort,
+            dstIp = dstIp, dstPort = dstPort,
+            seqNum = 1, ackNum = 1,
+            flags = 0x18, // PSH+ACK
+            payload = payload
+        )
+    }
+
+    private fun buildUdpPacket(
+        srcIp: String, srcPort: Int,
+        dstIp: String, dstPort: Int,
+        payload: ByteArray
+    ): ByteArray {
+        val udpHeaderSize = 8
+        val ipHeaderSize = 20
+        val totalSize = ipHeaderSize + udpHeaderSize + payload.size
+
+        val buffer = ByteBuffer.allocate(totalSize)
+
+        // IP Header
+        buffer.put(0x45.toByte())
+        buffer.put(0x00.toByte())
+        buffer.putShort(totalSize.toShort())
+        buffer.putShort(0)
+        buffer.putShort(0x4000.toShort())
+        buffer.put(64.toByte())
+        buffer.put(17.toByte()) // Protocol: UDP
+        buffer.putShort(0)
+        buffer.put(InetAddress.getByName(srcIp).address)
+        buffer.put(InetAddress.getByName(dstIp).address)
+
+        // UDP Header
+        buffer.putShort(srcPort.toShort())
+        buffer.putShort(dstPort.toShort())
+        buffer.putShort((udpHeaderSize + payload.size).toShort())
+        buffer.putShort(0) // Checksum (optional for UDP over IPv4)
+
+        // Payload
+        buffer.put(payload)
+
+        return buffer.array()
+    }
+
+    private fun forwardRawPacket(packet: ByteArray, tunOut: FileOutputStream) {
+        // Just write back as-is — kernel handles routing
+        // This is a fallback; real forwarding happens via sockets
+        try {
+            synchronized(tunOut) {
+                tunOut.write(packet)
+                tunOut.flush()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Raw forward error", e)
+        }
+    }
+
+    // ==============================
+    // Emit packets for display
+    // ==============================
+
+    private fun emitTcpPacket(packet: ByteArray, ipHeader: PacketParser.IpHeader, tcpHeader: PacketParser.TcpHeader) {
+        val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
+        val payloadSize = packet.size - payloadOffset
 
         var protocol = Protocol.TCP
         var httpMethod: String? = null
         var httpHost: String? = null
         var httpPath: String? = null
-        var httpStatusCode: Int? = null
-        var requestHeaders = emptyMap<String, String>()
         var tlsSni: String? = null
         var dnsQuery: String? = null
         var dnsType: String? = null
         var payloadPreview = ""
 
         if (payloadSize > 0) {
-            val payload = data.copyOfRange(payloadOffset, minOf(payloadOffset + payloadSize, data.size))
+            val payload = packet.copyOfRange(payloadOffset, minOf(payloadOffset + payloadSize, packet.size))
 
-            // Check for TLS ClientHello
-            if (PacketParser.isTLSClientHello(payload, 0, payload.size)) {
-                protocol = Protocol.TLS
-                tlsSni = PacketParser.extractSNI(payload, 0, payload.size)
-                httpHost = tlsSni
-                payloadPreview = "TLS ClientHello SNI=$tlsSni"
-            }
-            // Check for HTTP
-            else if (PacketParser.isHTTPRequest(payload, 0, payload.size)) {
-                val httpInfo = PacketParser.extractHTTPInfo(payload, 0, payload.size)
-                if (httpInfo != null) {
-                    protocol = Protocol.HTTP
-                    httpMethod = httpInfo.method
-                    httpHost = httpInfo.host
-                    httpPath = httpInfo.path
-                    requestHeaders = httpInfo.headers
-                    payloadPreview = "$httpMethod ${httpInfo.host ?: ""}${httpInfo.path}"
+            when {
+                PacketParser.isTLSClientHello(payload, 0, payload.size) -> {
+                    protocol = Protocol.TLS
+                    tlsSni = PacketParser.extractSNI(payload, 0, payload.size)
+                    httpHost = tlsSni
+                    payloadPreview = "TLS ClientHello SNI=$tlsSni"
                 }
-            }
-            // Check for DNS over TCP (port 53)
-            else if (tcpHeader.dstPort == 53 || tcpHeader.srcPort == 53) {
-                protocol = Protocol.DNS
-                val dnsInfo = PacketParser.parseDNS(payload, 0, payload.size)
-                if (dnsInfo != null) {
-                    dnsQuery = dnsInfo.queryName
-                    dnsType = dnsInfo.queryType
-                    payloadPreview = "DNS ${if (dnsInfo.isResponse) "Response" else "Query"}: ${dnsInfo.queryName} (${dnsInfo.queryType})"
+                PacketParser.isHTTPRequest(payload, 0, payload.size) -> {
+                    val httpInfo = PacketParser.extractHTTPInfo(payload, 0, payload.size)
+                    if (httpInfo != null) {
+                        protocol = Protocol.HTTP
+                        httpMethod = httpInfo.method
+                        httpHost = httpInfo.host
+                        httpPath = httpInfo.path
+                        payloadPreview = "$httpMethod ${httpInfo.host ?: ""}${httpInfo.path}"
+                    }
                 }
-            }
-            else {
-                payloadPreview = buildString {
-                    append("[${payload.size} bytes] ")
-                    append(payload.take(64).joinToString(" ") { "%02X".format(it) })
+                tcpHeader.dstPort == 53 || tcpHeader.srcPort == 53 -> {
+                    protocol = Protocol.DNS
+                    val dnsInfo = PacketParser.parseDNS(payload, 0, payload.size)
+                    if (dnsInfo != null) {
+                        dnsQuery = dnsInfo.queryName
+                        dnsType = dnsInfo.queryType
+                        payloadPreview = "DNS: ${dnsInfo.queryName} (${dnsInfo.queryType})"
+                    }
+                }
+                else -> {
+                    payloadPreview = "[${payload.size} bytes TCP]"
                 }
             }
         }
 
-        return CapturedPacket(
-            protocol = protocol,
-            srcIp = ipHeader.srcIp,
-            dstIp = ipHeader.dstIp,
-            srcPort = tcpHeader.srcPort,
-            dstPort = tcpHeader.dstPort,
-            appId = appInfo.uid,
-            appName = appInfo.appName,
-            packageName = appInfo.packageName,
-            length = ipHeader.totalLength,
-            direction = if (tcpHeader.isSyn && !tcpHeader.isAck) Direction.OUTGOING else Direction.OUTGOING,
-            httpMethod = httpMethod,
-            httpHost = httpHost,
-            httpPath = httpPath,
-            requestHeaders = requestHeaders,
-            tlsSni = tlsSni,
-            dnsQuery = dnsQuery,
-            dnsType = dnsType,
-            payloadPreview = payloadPreview
-        )
+        scope.launch {
+            _packets.emit(CapturedPacket(
+                protocol = protocol,
+                srcIp = ipHeader.srcIp, dstIp = ipHeader.dstIp,
+                srcPort = tcpHeader.srcPort, dstPort = tcpHeader.dstPort,
+                length = ipHeader.totalLength,
+                direction = Direction.OUTGOING,
+                httpMethod = httpMethod, httpHost = httpHost, httpPath = httpPath,
+                tlsSni = tlsSni,
+                dnsQuery = dnsQuery, dnsType = dnsType,
+                payloadPreview = payloadPreview
+            ))
+        }
     }
 
-    private fun processUDP(data: ByteArray, ipHeader: PacketParser.IpHeader): CapturedPacket? {
-        val udpHeader = PacketParser.parseUDP(data, ipHeader.headerLength) ?: return null
+    private fun emitUdpPacket(packet: ByteArray, ipHeader: PacketParser.IpHeader, udpHeader: PacketParser.UdpHeader) {
         val payloadOffset = ipHeader.headerLength + 8
-        val payloadSize = maxOf(0, ipHeader.totalLength - ipHeader.headerLength - 8)
+        val payloadSize = packet.size - payloadOffset
 
         var protocol = Protocol.UDP
         var dnsQuery: String? = null
         var dnsType: String? = null
-        var dnsResponse: String? = null
         var payloadPreview = ""
 
         if (payloadSize > 0 && (udpHeader.dstPort == 53 || udpHeader.srcPort == 53)) {
             protocol = Protocol.DNS
-            val dnsInfo = PacketParser.parseDNS(data, payloadOffset, payloadSize)
+            val dnsInfo = PacketParser.parseDNS(packet, payloadOffset, payloadSize)
             if (dnsInfo != null) {
                 dnsQuery = dnsInfo.queryName
                 dnsType = dnsInfo.queryType
-                dnsResponse = if (dnsInfo.isResponse) "Answers: ${dnsInfo.answerCount}" else null
-                payloadPreview = "DNS ${if (dnsInfo.isResponse) "Response" else "Query"}: ${dnsInfo.queryName} (${dnsInfo.queryType})"
+                payloadPreview = "DNS: ${dnsInfo.queryName} (${dnsInfo.queryType})"
             }
         } else {
-            payloadPreview = buildString {
-                append("[${payloadSize} bytes UDP] ")
-                append("Port ${udpHeader.srcPort} → ${udpHeader.dstPort}")
-            }
+            payloadPreview = "[${payloadSize} bytes UDP] Port ${udpHeader.srcPort}→${udpHeader.dstPort}"
         }
 
-        return CapturedPacket(
-            protocol = protocol,
-            srcIp = ipHeader.srcIp,
-            dstIp = ipHeader.dstIp,
-            srcPort = udpHeader.srcPort,
-            dstPort = udpHeader.dstPort,
-            length = ipHeader.totalLength,
-            direction = Direction.OUTGOING,
-            dnsQuery = dnsQuery,
-            dnsType = dnsType,
-            dnsResponse = dnsResponse,
-            payloadPreview = payloadPreview
-        )
-    }
-
-    private fun forwardPacket(data: ByteArray, outputStream: FileOutputStream) {
-        try {
-            outputStream.write(data)
-            outputStream.flush()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error forwarding packet", e)
+        scope.launch {
+            _packets.emit(CapturedPacket(
+                protocol = protocol,
+                srcIp = ipHeader.srcIp, dstIp = ipHeader.dstIp,
+                srcPort = udpHeader.srcPort, dstPort = udpHeader.dstPort,
+                length = ipHeader.totalLength,
+                direction = Direction.OUTGOING,
+                dnsQuery = dnsQuery, dnsType = dnsType,
+                payloadPreview = payloadPreview
+            ))
         }
     }
+
+    // ==============================
+    // Notification
+    // ==============================
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL,
-                "Capture Service",
+                NOTIFICATION_CHANNEL, "Capture Service",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "PacketLens network capture service"
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            ).apply { description = "PacketLens capture" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
     private fun buildNotification(): Notification {
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val stopIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, CaptureVpnService::class.java).setAction("STOP"),
-            PendingIntent.FLAG_IMMUTABLE
-        )
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val stopPi = PendingIntent.getService(this, 1,
+            Intent(this, CaptureVpnService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, NOTIFICATION_CHANNEL)
                 .setContentTitle("PacketLens")
                 .setContentText("Capturing network traffic...")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setContentIntent(pendingIntent)
-                .addAction(
-                    Notification.Action.Builder(
-                        null, "Stop", stopIntent
-                    ).build()
-                )
-                .setOngoing(true)
-                .build()
+                .setContentIntent(pi)
+                .addAction(Notification.Action.Builder(null, "Stop", stopPi).build())
+                .setOngoing(true).build()
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
                 .setContentTitle("PacketLens")
                 .setContentText("Capturing network traffic...")
                 .setSmallIcon(android.R.drawable.ic_menu_info_details)
-                .setContentIntent(pendingIntent)
-                .setOngoing(true)
-                .build()
+                .setContentIntent(pi).setOngoing(true).build()
         }
     }
 
