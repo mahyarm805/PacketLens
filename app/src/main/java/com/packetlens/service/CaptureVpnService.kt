@@ -28,10 +28,11 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 import javax.inject.Inject
 
 /**
- * VPN-based network traffic capture service.
+ * VPN-based network traffic capture service with proper TCP proxy.
  *
  * Architecture:
  *   App → TUN (read) → Parse/Inspect → Real Socket (protect) → Internet
@@ -39,6 +40,10 @@ import javax.inject.Inject
  *
  * Key: We use protect() on real sockets so they bypass the VPN tunnel
  * and go directly to the internet, avoiding infinite loops.
+ *
+ * For TCP: We maintain per-connection state (localSeq / remoteSeq) so that
+ * every packet sent to/from the TUN has correct, incrementing sequence and
+ * acknowledgement numbers. Without this the kernel drops all response packets.
  *
  * IMPORTANT: When writing raw IP packets to a TUN device, the kernel does NOT
  * fill in checksums. We must compute IP header checksums, TCP checksums
@@ -72,14 +77,42 @@ class CaptureVpnService : VpnService() {
     private var captureJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Track TCP connections: srcPort → protected Socket
-    private val tcpConnections = ConcurrentHashMap<Int, Socket>()
+    // ========================================================================
+    // Per-connection TCP state — the heart of the proper proxy
+    // ========================================================================
 
-    // Track UDP sessions: srcPort → protected DatagramSocket
+    /**
+     * Tracks the TCP state for one proxied connection.
+     *
+     * @param socket     The protected real socket to the remote server.
+     * @param remoteIp   Real server IP (as seen in original outgoing packet).
+     * @param remotePort Real server port.
+     * @param localPort  The app's ephemeral source port (dst port in packets we send back).
+     * @param localSeq   Sequence number WE send to the app (server→app direction).
+     *                   Starts at a random value, incremented by each payload we write to TUN.
+     * @param remoteSeq  Sequence number the APP sends to us (app→server direction).
+     *                   Starts at the SYN seq + 1 (the SYN consumes one seq), updated
+     *                   from the app's ACK / data packets.
+     * @param closed     Set to true once FIN or RST has been processed.
+     */
+    private data class TcpConnectionState(
+        val socket: Socket,
+        val remoteIp: String,
+        val remotePort: Int,
+        val localPort: Int,
+        var localSeq: Long,
+        var remoteSeq: Long,
+        var closed: Boolean = false
+    )
+
+    /** Key = app's source port (unique per connection from the app's perspective). */
+    private val tcpConnections = ConcurrentHashMap<Int, TcpConnectionState>()
+
+    /** Set of source ports that currently have a reader coroutine active. */
+    private val activeTcpReaders = ConcurrentHashMap.newKeySet<Int>()
+
+    /** Key = app's source port. */
     private val udpSessions = ConcurrentHashMap<Int, DatagramSocket>()
-
-    private var nextTcpPort = 20000
-    private var nextUdpPort = 30000
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -126,8 +159,12 @@ class CaptureVpnService : VpnService() {
         captureJob = null
 
         // Close all tracked connections
-        tcpConnections.values.forEach { try { it.close() } catch (_: Exception) {} }
+        tcpConnections.values.forEach { state ->
+            state.closed = true
+            try { state.socket.close() } catch (_: Exception) {}
+        }
         tcpConnections.clear()
+        activeTcpReaders.clear()
         udpSessions.values.forEach { try { it.close() } catch (_: Exception) {} }
         udpSessions.clear()
 
@@ -140,9 +177,9 @@ class CaptureVpnService : VpnService() {
         Log.i(TAG, "Capture stopped")
     }
 
-    // ==============================
+    // ==========================================================================
     // Main capture loop
-    // ==============================
+    // ==========================================================================
 
     private fun runCaptureLoop() {
         val fd = vpnInterface?.fileDescriptor ?: return
@@ -170,9 +207,9 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ==============================
+    // ==========================================================================
     // Process packet from TUN (app → internet direction)
-    // ==============================
+    // ==========================================================================
 
     private fun processIncomingPacket(packet: ByteArray, tunOut: FileOutputStream) {
         val ipHeader = PacketParser.parseIPv4(packet) ?: return
@@ -187,9 +224,9 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ==============================
+    // ==========================================================================
     // TCP Handling
-    // ==============================
+    // ==========================================================================
 
     private fun handleTCP(packet: ByteArray, ipHeader: PacketParser.IpHeader, tunOut: FileOutputStream) {
         val tcpHeader = PacketParser.parseTCP(packet, ipHeader.headerLength) ?: run {
@@ -197,46 +234,79 @@ class CaptureVpnService : VpnService() {
             return
         }
 
-        val srcPort = tcpHeader.srcPort
-        val dstIp = ipHeader.dstIp
-        val dstPort = tcpHeader.dstPort
+        val srcPort = tcpHeader.srcPort   // app's ephemeral port
+        val dstIp = ipHeader.dstIp        // real server IP
+        val dstPort = tcpHeader.dstPort   // real server port
 
         // Emit for capture/display
         emitTcpPacket(packet, ipHeader, tcpHeader)
 
+        // ---------------------------------------------------------------
         // SYN = new connection request
+        // ---------------------------------------------------------------
         if (tcpHeader.isSyn && !tcpHeader.isAck) {
-            launchNewTcpConnection(srcPort, dstIp, dstPort, tunOut)
+            launchNewTcpConnection(srcPort, dstIp, dstPort, tcpHeader.seqNum, tunOut)
             return
         }
 
-        // FIN/RST = close connection
+        // ---------------------------------------------------------------
+        // FIN / RST = close connection
+        // ---------------------------------------------------------------
         if (tcpHeader.isFin || tcpHeader.isRst) {
-            closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
+            handleTcpClose(srcPort, ipHeader, tcpHeader, tunOut)
             return
         }
 
-        // Data packet — forward payload through the real socket
-        val socket = tcpConnections[srcPort]
-        if (socket != null && socket.isConnected) {
-            val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
-            val payloadSize = packet.size - payloadOffset
-            if (payloadSize > 0) {
-                try {
-                    val payload = packet.copyOfRange(payloadOffset, packet.size)
-                    socket.getOutputStream().write(payload)
-                    socket.getOutputStream().flush()
-                } catch (e: Exception) {
-                    Log.e(TAG, "TCP write error", e)
-                    closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
-                }
+        // ---------------------------------------------------------------
+        // ACK (possibly with data) — update remoteSeq and forward payload
+        // ---------------------------------------------------------------
+        val state = tcpConnections[srcPort]
+        if (state == null || state.closed) return
+
+        // Update the app's sequence tracker.
+        // The app's remoteSeq should equal the seq it sent + payloadSize.
+        // We use the payload size from the TCP header to advance.
+        val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
+        val payloadSize = packet.size - payloadOffset
+        if (payloadSize > 0) {
+            // Data packet from the app → forward payload to real server
+            state.remoteSeq = tcpHeader.seqNum + payloadSize
+            try {
+                val payload = packet.copyOfRange(payloadOffset, packet.size)
+                state.socket.getOutputStream().write(payload)
+                state.socket.getOutputStream().flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "TCP write error to remote: $srcPort → ${state.remoteIp}:${state.remotePort}", e)
+                handleTcpClose(srcPort, ipHeader, tcpHeader, tunOut)
+                return
             }
-            // Launch a reader thread for this connection if not already running
-            ensureTcpReader(srcPort, ipHeader, tcpHeader, tunOut)
+        } else {
+            // Pure ACK — just update remoteSeq (ack of our data, or handshake ACK)
+            state.remoteSeq = tcpHeader.seqNum
         }
+
+        // Ensure we have a reader thread pulling from the real socket
+        ensureTcpReader(srcPort, state, tunOut)
     }
 
-    private fun launchNewTcpConnection(srcPort: Int, dstIp: String, dstPort: Int, tunOut: FileOutputStream) {
+    /**
+     * Handle a new TCP SYN from the app.
+     *
+     * Flow:
+     * 1. App sends SYN  → we read from TUN
+     * 2. We create a protected Socket to real IP:port
+     * 3. We send SYN-ACK back to TUN:
+     *      src = remote server, dst = app
+     *      seq = random local start, ack = app SYN seq + 1
+     * 4. App will send ACK → handled in handleTCP → connection established
+     */
+    private fun launchNewTcpConnection(
+        srcPort: Int,
+        dstIp: String,
+        dstPort: Int,
+        appSynSeq: Long,
+        tunOut: FileOutputStream
+    ) {
         scope.launch {
             try {
                 val socket = Socket()
@@ -244,34 +314,34 @@ class CaptureVpnService : VpnService() {
                 protect(socket)
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(dstIp, dstPort), 5000)
-                tcpConnections[srcPort] = socket
+
+                // Random local sequence start for the server→app direction
+                val localStartSeq = Random.nextLong(1L, 0xFFFFFFFFL)
+
+                val state = TcpConnectionState(
+                    socket = socket,
+                    remoteIp = dstIp,
+                    remotePort = dstPort,
+                    localPort = srcPort,
+                    localSeq = localStartSeq,
+                    remoteSeq = appSynSeq + 1  // SYN consumes 1 sequence number
+                )
+                tcpConnections[srcPort] = state
 
                 // Send SYN-ACK back to TUN (towards the app)
                 val synAck = buildTcpPacket(
                     srcIp = dstIp, srcPort = dstPort,
                     dstIp = VPN_ADDRESS, dstPort = srcPort,
-                    seqNum = System.currentTimeMillis(),
-                    ackNum = 1,
-                    flags = 0x12 // SYN+ACK
+                    seqNum = localStartSeq,
+                    ackNum = appSynSeq + 1,  // ACK the SYN (seq + 1)
+                    flags = 0x12  // SYN+ACK
                 )
-                tunOut.write(synAck)
-                tunOut.flush()
+                synchronized(tunOut) {
+                    tunOut.write(synAck)
+                    tunOut.flush()
+                }
 
-                // Also send ACK to complete handshake
-                val ack = buildTcpPacket(
-                    srcIp = dstIp, srcPort = dstPort,
-                    dstIp = VPN_ADDRESS, dstPort = srcPort,
-                    seqNum = 1,
-                    ackNum = 1,
-                    flags = 0x10 // ACK
-                )
-                tunOut.write(ack)
-                tunOut.flush()
-
-                Log.d(TAG, "TCP connection established: $srcPort → $dstIp:$dstPort")
-
-                // Start reading responses
-                ensureTcpReader(srcPort, ipHeader = null, tcpHeader = null, tunOut = tunOut)
+                Log.d(TAG, "TCP SYN-ACK sent: $srcPort ↔ $dstIp:$dstPort (localSeq=$localStartSeq, ack=${appSynSeq + 1})")
 
             } catch (e: Exception) {
                 Log.e(TAG, "TCP connect failed: $srcPort → $dstIp:$dstPort", e)
@@ -283,34 +353,47 @@ class CaptureVpnService : VpnService() {
                     flags = 0x04 // RST
                 )
                 try {
-                    tunOut.write(rst)
-                    tunOut.flush()
+                    synchronized(tunOut) {
+                        tunOut.write(rst)
+                        tunOut.flush()
+                    }
                 } catch (_: Exception) {}
             }
         }
     }
 
-    private fun ensureTcpReader(srcPort: Int, ipHeader: PacketParser.IpHeader?, tcpHeader: PacketParser.TcpHeader?, tunOut: FileOutputStream) {
-        val socket = tcpConnections[srcPort] ?: return
-        // Use a tag to prevent duplicate reader threads
-        val readerKey = "tcp_reader_$srcPort"
+    /**
+     * Start a coroutine that reads data from the protected real socket
+     * and writes properly-addressed IP packets back into the TUN.
+     *
+     * Only one reader coroutine is launched per srcPort.
+     */
+    private fun ensureTcpReader(srcPort: Int, state: TcpConnectionState, tunOut: FileOutputStream) {
+        if (!activeTcpReaders.add(srcPort)) return // already running
 
         scope.launch {
             val buffer = ByteArray(MTU)
             try {
-                val input = socket.getInputStream()
-                while (isCapturing && socket.isConnected && !socket.isClosed) {
+                val input = state.socket.getInputStream()
+                while (isCapturing && state.socket.isConnected && !state.socket.isClosed) {
                     val read = input.read(buffer)
                     if (read <= 0) break
 
                     val data = buffer.copyOf(read)
-                    val responsePacket = buildTcpDataPacket(
-                        srcIp = socket.remoteSocketAddress.toString().substringBefore(":").removePrefix("/"),
-                        srcPort = (socket.remoteSocketAddress as? InetSocketAddress)?.port ?: 443,
-                        dstIp = VPN_ADDRESS,
-                        dstPort = srcPort,
+
+                    // Build response packet: src = real server, dst = app
+                    // localSeq tracks the sequence number WE (proxy) are sending
+                    val responsePacket = buildTcpPacket(
+                        srcIp = state.remoteIp, srcPort = state.remotePort,
+                        dstIp = VPN_ADDRESS, dstPort = state.localPort,
+                        seqNum = state.localSeq,
+                        ackNum = state.remoteSeq,
+                        flags = 0x18,  // PSH+ACK
                         payload = data
                     )
+
+                    // Advance localSeq by the amount of data we sent
+                    state.localSeq += data.size
 
                     synchronized(tunOut) {
                         tunOut.write(responsePacket)
@@ -318,40 +401,75 @@ class CaptureVpnService : VpnService() {
                     }
                 }
             } catch (e: Exception) {
-                if (isCapturing) Log.d(TAG, "TCP reader closed: $srcPort")
+                if (isCapturing) Log.d(TAG, "TCP reader closed: $srcPort — ${e.message}")
             } finally {
-                closeTcpConnection(srcPort, ipHeader, tcpHeader, tunOut)
+                activeTcpReaders.remove(srcPort)
+                handleTcpCloseFromReader(srcPort, state, tunOut)
             }
         }
     }
 
-    private fun closeTcpConnection(srcPort: Int, ipHeader: PacketParser.IpHeader?, tcpHeader: PacketParser.TcpHeader?, tunOut: FileOutputStream) {
-        val socket = tcpConnections.remove(srcPort) ?: return
-        try { socket.close() } catch (_: Exception) {}
+    /**
+     * Handle FIN/RST from the app side.
+     */
+    private fun handleTcpClose(
+        srcPort: Int,
+        ipHeader: PacketParser.IpHeader,
+        tcpHeader: PacketParser.TcpHeader,
+        tunOut: FileOutputStream
+    ) {
+        val state = tcpConnections.remove(srcPort) ?: return
+        state.closed = true
+        activeTcpReaders.remove(srcPort)
+        try { state.socket.close() } catch (_: Exception) {}
 
-        // Send FIN+ACK to app so it knows the connection is closed
-        if (ipHeader != null && tcpHeader != null) {
+        // Send FIN+ACK back to the app
+        try {
+            val finAck = buildTcpPacket(
+                srcIp = state.remoteIp, srcPort = state.remotePort,
+                dstIp = VPN_ADDRESS, dstPort = srcPort,
+                seqNum = state.localSeq,
+                ackNum = state.remoteSeq + 1,  // ACK the FIN (consumes 1 seq)
+                flags = 0x11  // FIN+ACK
+            )
+            synchronized(tunOut) {
+                tunOut.write(finAck)
+                tunOut.flush()
+            }
+        } catch (_: Exception) {}
+
+        Log.d(TAG, "TCP closed (app-initiated): $srcPort")
+    }
+
+    /**
+     * Handle close from the reader side (real server closed or error).
+     * Sends FIN to the app so it knows the connection is gone.
+     */
+    private fun handleTcpCloseFromReader(srcPort: Int, state: TcpConnectionState, tunOut: FileOutputStream) {
+        val removed = tcpConnections.remove(srcPort)
+        if (removed != null) {
+            state.closed = true
+            try { state.socket.close() } catch (_: Exception) {}
+
             try {
-                val finAck = buildTcpPacket(
-                    srcIp = ipHeader.dstIp,
-                    srcPort = tcpHeader.dstPort,
-                    dstIp = VPN_ADDRESS,
-                    dstPort = srcPort,
-                    seqNum = 1,
-                    ackNum = 1,
-                    flags = 0x11 // FIN+ACK
+                val fin = buildTcpPacket(
+                    srcIp = state.remoteIp, srcPort = state.remotePort,
+                    dstIp = VPN_ADDRESS, dstPort = srcPort,
+                    seqNum = state.localSeq,
+                    ackNum = state.remoteSeq,
+                    flags = 0x11  // FIN+ACK
                 )
                 synchronized(tunOut) {
-                    tunOut.write(finAck)
+                    tunOut.write(fin)
                     tunOut.flush()
                 }
             } catch (_: Exception) {}
         }
     }
 
-    // ==============================
+    // ==========================================================================
     // UDP Handling
-    // ==============================
+    // ==========================================================================
 
     private fun handleUDP(packet: ByteArray, ipHeader: PacketParser.IpHeader, tunOut: FileOutputStream) {
         val udpHeader = PacketParser.parseUDP(packet, ipHeader.headerLength) ?: run {
@@ -478,9 +596,9 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ============================================================
-    // Checksum calculation helpers
-    // ============================================================
+    // ==========================================================================
+    // Checksum calculation helpers (RFC 1071)
+    // ==========================================================================
 
     /**
      * Compute IP header checksum over the first [length] bytes of [data].
@@ -516,9 +634,7 @@ class CaptureVpnService : VpnService() {
      *   src IP (4) + dst IP (4) + zero (1) + protocol (1) + TCP/UDP length (2)
      *
      * The transport data starts at [transportOffset] in [fullPacket] and is
-     * [transportLength] bytes long (header + payload). For UDP over IPv4,
-     * a checksum of 0 means "not computed", but we compute it anyway so the
-     * kernel doesn't drop the packet.
+     * [transportLength] bytes long (header + payload).
      */
     private fun computeTransportChecksum(
         fullPacket: ByteArray,
@@ -562,12 +678,12 @@ class CaptureVpnService : VpnService() {
         return sum.toInt().inv() and 0xFFFF
     }
 
-    // ============================================================
+    // ==========================================================================
     // Packet builders (construct IP packets to write back to TUN)
     //
     // All checksums are computed here — the kernel will NOT fill them
     // in for packets written to a TUN file descriptor.
-    // ============================================================
+    // ==========================================================================
 
     private fun buildTcpPacket(
         srcIp: String, srcPort: Int,
@@ -626,20 +742,6 @@ class CaptureVpnService : VpnService() {
         packet[tcpStart + 17] = (tcpChecksum and 0xFF).toByte()
 
         return packet
-    }
-
-    private fun buildTcpDataPacket(
-        srcIp: String, srcPort: Int,
-        dstIp: String, dstPort: Int,
-        payload: ByteArray
-    ): ByteArray {
-        return buildTcpPacket(
-            srcIp = srcIp, srcPort = srcPort,
-            dstIp = dstIp, dstPort = dstPort,
-            seqNum = 1, ackNum = 1,
-            flags = 0x18, // PSH+ACK
-            payload = payload
-        )
     }
 
     private fun buildUdpPacket(
@@ -710,9 +812,9 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ==============================
+    // ==========================================================================
     // Emit packets for display
-    // ==============================
+    // ==========================================================================
 
     private fun emitTcpPacket(packet: ByteArray, ipHeader: PacketParser.IpHeader, tcpHeader: PacketParser.TcpHeader) {
         val payloadOffset = ipHeader.headerLength + tcpHeader.headerLength
@@ -811,9 +913,9 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ==============================
+    // ==========================================================================
     // Notification
-    // ==============================
+    // ==========================================================================
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

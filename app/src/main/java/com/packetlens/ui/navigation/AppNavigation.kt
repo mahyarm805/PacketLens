@@ -18,7 +18,10 @@ fun AppNavigation() {
 
     NavHost(navController = navController, startDestination = "home") {
         composable("home") {
+            val homeEntry = remember { navController.getBackStackEntry("home") }
+            val viewModel: CaptureViewModel = hiltViewModel(homeEntry)
             HomeScreen(
+                viewModel = viewModel,
                 onPacketClick = { packetId ->
                     navController.navigate("detail/$packetId")
                 }

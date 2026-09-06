@@ -21,19 +21,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.compose.ui.platform.LocalContext
-import androidx.activity.ComponentActivity
 import com.packetlens.ui.components.PacketRow
 import com.packetlens.ui.viewmodel.CaptureViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
-    onPacketClick: (Long) -> Unit,
-    viewModel: CaptureViewModel = hiltViewModel(
-        viewModelStoreOwner = LocalContext.current as ComponentActivity
-    )
+    viewModel: CaptureViewModel,
+    onPacketClick: (Long) -> Unit
 ) {
     val packets by viewModel.packets.collectAsState()
     val isCapturing by viewModel.isCapturing.collectAsState()
