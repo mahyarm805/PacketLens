@@ -77,6 +77,15 @@ class CaptureVpnService : VpnService() {
     private var captureJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // Packet counters for diagnostics
+    private var pktsRead = 0L
+    private var pktsFwdTcp = 0L
+    private var pktsFwdUdp = 0L
+    private var pktsFwdDns = 0L
+    private var pktsWrittenTun = 0L
+    private var pktsDropped = 0L
+    private var pktsErrors = 0L
+
     // ========================================================================
     // Per-connection TCP state — the heart of the proper proxy
     // ========================================================================
@@ -145,6 +154,7 @@ class CaptureVpnService : VpnService() {
         }
 
         isCapturing = true
+        pktsRead = 0; pktsFwdTcp = 0; pktsFwdUdp = 0; pktsFwdDns = 0; pktsWrittenTun = 0; pktsDropped = 0; pktsErrors = 0
         scope.launch { _isRunning.emit(true) }
 
         // Main loop: read from TUN → parse → forward → response → write to TUN
@@ -174,7 +184,7 @@ class CaptureVpnService : VpnService() {
         scope.launch { _isRunning.emit(false) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        Log.i(TAG, "Capture stopped")
+        Log.i(TAG, "Capture stopped | FINAL: read=$pktsRead tcp=$pktsFwdTcp udp=$pktsFwdUdp dns=$pktsFwdDns tun_wr=$pktsWrittenTun drop=$pktsDropped err=$pktsErrors")
     }
 
     // ==========================================================================
@@ -196,11 +206,16 @@ class CaptureVpnService : VpnService() {
                 }
 
                 val packet = buffer.copyOf(length)
+                pktsRead++
                 processIncomingPacket(packet, tunOut)
+                if (pktsRead % 500L == 0L) {
+                    Log.i(TAG, "PKT COUNT  read=$pktsRead tcp=$pktsFwdTcp udp=$pktsFwdUdp dns=$pktsFwdDns tun_wr=$pktsWrittenTun drop=$pktsDropped err=$pktsErrors")
+                }
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 if (isCapturing) {
+                    pktsErrors++
                     Log.e(TAG, "Error in capture loop", e)
                 }
             }
@@ -282,6 +297,7 @@ class CaptureVpnService : VpnService() {
                 val payload = packet.copyOfRange(payloadOffset, packet.size)
                 state.socket.getOutputStream().write(payload)
                 state.socket.getOutputStream().flush()
+                pktsFwdTcp++
                 Log.d(TAG, "TCP FWD OK [${ipHeader.srcIp}:${srcPort} → ${state.remoteIp}:${state.remotePort}] ${payloadSize}B forwarded to real socket")
             } catch (e: Exception) {
                 Log.e(TAG, "TCP write error to remote: $srcPort → ${state.remoteIp}:${state.remotePort}", e)
@@ -354,8 +370,8 @@ class CaptureVpnService : VpnService() {
                 synchronized(tunOut) {
                     tunOut.write(synAck)
                     tunOut.flush()
+                    pktsWrittenTun++
                 }
-
                 Log.i(TAG, "TCP SYN    [${VPN_ADDRESS}:${srcPort} → $dstIp:$dstPort] appSeq=$appSynSeq")
                 Log.i(TAG, "TCP SYN-ACK[seq=$localStartSeq, ack=${appSynSeq + 1}] ${VPN_ADDRESS}:${srcPort} ← $dstIp:$dstPort")
                 Log.i(TAG, "TCP STATE  [${VPN_ADDRESS}:${srcPort} ↔ $dstIp:$dstPort] localSeq=${state.localSeq} remoteSeq=${state.remoteSeq} → waiting for ACK")
@@ -455,6 +471,7 @@ class CaptureVpnService : VpnService() {
             synchronized(tunOut) {
                 tunOut.write(finAck)
                 tunOut.flush()
+                pktsWrittenTun++
             }
             // FIN consumes 1 sequence number
             state.localSeq += 1
@@ -483,6 +500,7 @@ class CaptureVpnService : VpnService() {
                 synchronized(tunOut) {
                     tunOut.write(fin)
                     tunOut.flush()
+                    pktsWrittenTun++
                 }
                 // FIN consumes 1 sequence number
                 state.localSeq += 1
@@ -537,6 +555,7 @@ class CaptureVpnService : VpnService() {
                     val destAddr = InetAddress.getByName(dstIp)
                     val dgPacket = DatagramPacket(payload, payload.size, destAddr, dstPort)
                     udpSocket.send(dgPacket)
+                    pktsFwdUdp++
                 } catch (e: Exception) {
                     Log.e(TAG, "UDP forward error", e)
                 }
@@ -577,6 +596,8 @@ class CaptureVpnService : VpnService() {
                 synchronized(tunOut) {
                     tunOut.write(responseIpPacket)
                     tunOut.flush()
+                    pktsFwdDns++
+                    pktsWrittenTun++
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "DNS forward error", e)
@@ -737,7 +758,7 @@ class CaptureVpnService : VpnService() {
 
         // Compute IP header checksum over the first 20 bytes
         val ipChecksum = computeIpChecksum(buffer.array(), ipHeaderSize)
-        buffer.putShort(ipHeaderSize + 10, ipChecksum.toShort())
+        buffer.putShort(10, ipChecksum.toShort())  // IP checksum is at bytes 10-11 of the IP header
 
         // TCP Header (20 bytes)
         val tcpStart = ipHeaderSize
@@ -794,7 +815,7 @@ class CaptureVpnService : VpnService() {
 
         // Compute IP header checksum
         val ipChecksum = computeIpChecksum(buffer.array(), ipHeaderSize)
-        buffer.putShort(ipHeaderSize + 10, ipChecksum.toShort())
+        buffer.putShort(10, ipChecksum.toShort())  // IP checksum is at bytes 10-11 of the IP header
 
         // UDP Header
         val udpStart = ipHeaderSize
@@ -829,6 +850,7 @@ class CaptureVpnService : VpnService() {
         // Unknown protocols (ICMP etc) are simply dropped. This is safe
         // because only TCP/UDP need forwarding; ICMP doesn't affect connectivity.
         Log.d(TAG, "Dropped unknown protocol packet (${packet.size} bytes)")
+        pktsDropped++
     }
 
     // ==========================================================================
