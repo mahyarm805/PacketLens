@@ -541,10 +541,11 @@ class CaptureVpnService : VpnService() {
                 socket.close()
 
                 // Build IP+UDP packet with DNS response and write to TUN
+                // dstIp must be the APP (10.0.0.2), NOT the DNS server (8.8.8.8)
                 val responseIpPacket = buildUdpPacket(
                     srcIp = "8.8.8.8",
                     srcPort = 53,
-                    dstIp = ipHeader.dstIp,
+                    dstIp = ipHeader.srcIp,   // ← FIX: was ipHeader.dstIp (server), must be srcIp (app)
                     dstPort = udpHeader.srcPort,
                     payload = responseBuf.copyOf(responsePacket.length)
                 )
@@ -577,7 +578,7 @@ class CaptureVpnService : VpnService() {
                     val responsePacket = buildUdpPacket(
                         srcIp = dgPacket.address.hostAddress ?: "0.0.0.0",
                         srcPort = dgPacket.port,
-                        dstIp = ipHeader.dstIp,
+                        dstIp = ipHeader.srcIp,   // ← FIX: was ipHeader.dstIp (server), must be srcIp (app)
                         dstPort = srcPort,
                         payload = payload
                     )
@@ -800,16 +801,10 @@ class CaptureVpnService : VpnService() {
     }
 
     private fun forwardRawPacket(packet: ByteArray, tunOut: FileOutputStream) {
-        // Just write back as-is — kernel handles routing
-        // This is a fallback; real forwarding happens via sockets
-        try {
-            synchronized(tunOut) {
-                tunOut.write(packet)
-                tunOut.flush()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Raw forward error", e)
-        }
+        // DON'T write back to TUN — that causes an infinite loop!
+        // Unknown protocols (ICMP etc) are simply dropped. This is safe
+        // because only TCP/UDP need forwarding; ICMP doesn't affect connectivity.
+        Log.d(TAG, "Dropped unknown protocol packet (${packet.size} bytes)")
     }
 
     // ==========================================================================
