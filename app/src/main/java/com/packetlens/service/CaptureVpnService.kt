@@ -271,10 +271,18 @@ class CaptureVpnService : VpnService() {
         if (payloadSize > 0) {
             // Data packet from the app → forward payload to real server
             state.remoteSeq = tcpHeader.seqNum + payloadSize
+            val flagsStr = buildList {
+                if (tcpHeader.isSyn) add("SYN")
+                if (tcpHeader.isAck) add("ACK")
+                if (tcpHeader.isFin) add("FIN")
+                if (tcpHeader.isRst) add("RST")
+            }.joinToString("+")
+            Log.i(TAG, "TCP DATA   [${ipHeader.srcIp}:${srcPort} → ${state.remoteIp}:${state.remotePort}] flags=$flagsStr seq=${tcpHeader.seqNum} ack=${tcpHeader.ackNum} payload=${payloadSize}B localSeq=${state.localSeq} remoteSeq=${state.remoteSeq}")
             try {
                 val payload = packet.copyOfRange(payloadOffset, packet.size)
                 state.socket.getOutputStream().write(payload)
                 state.socket.getOutputStream().flush()
+                Log.d(TAG, "TCP FWD OK [${ipHeader.srcIp}:${srcPort} → ${state.remoteIp}:${state.remotePort}] ${payloadSize}B forwarded to real socket")
             } catch (e: Exception) {
                 Log.e(TAG, "TCP write error to remote: $srcPort → ${state.remoteIp}:${state.remotePort}", e)
                 handleTcpClose(srcPort, ipHeader, tcpHeader, tunOut)
@@ -283,6 +291,13 @@ class CaptureVpnService : VpnService() {
         } else {
             // Pure ACK — just update remoteSeq (ack of our data, or handshake ACK)
             state.remoteSeq = tcpHeader.seqNum
+            val flagsStr = buildList {
+                if (tcpHeader.isSyn) add("SYN")
+                if (tcpHeader.isAck) add("ACK")
+                if (tcpHeader.isFin) add("FIN")
+                if (tcpHeader.isRst) add("RST")
+            }.joinToString("+")
+            Log.i(TAG, "TCP ACK    [${ipHeader.srcIp}:${srcPort} → ${state.remoteIp}:${state.remotePort}] flags=$flagsStr seq=${tcpHeader.seqNum} ack=${tcpHeader.ackNum} localSeq=${state.localSeq} remoteSeq=${state.remoteSeq}")
         }
 
         // Ensure we have a reader thread pulling from the real socket
@@ -323,8 +338,8 @@ class CaptureVpnService : VpnService() {
                     remoteIp = dstIp,
                     remotePort = dstPort,
                     localPort = srcPort,
-                    localSeq = localStartSeq,
-                    remoteSeq = appSynSeq + 1  // SYN consumes 1 sequence number
+                    localSeq = localStartSeq + 1,  // SYN consumes 1 seq — first DATA must use seq+1
+                    remoteSeq = appSynSeq + 1       // SYN consumes 1 sequence number
                 )
                 tcpConnections[srcPort] = state
 
@@ -341,7 +356,9 @@ class CaptureVpnService : VpnService() {
                     tunOut.flush()
                 }
 
-                Log.d(TAG, "TCP SYN-ACK sent: $srcPort ↔ $dstIp:$dstPort (localSeq=$localStartSeq, ack=${appSynSeq + 1})")
+                Log.i(TAG, "TCP SYN    [${VPN_ADDRESS}:${srcPort} → $dstIp:$dstPort] appSeq=$appSynSeq")
+                Log.i(TAG, "TCP SYN-ACK[seq=$localStartSeq, ack=${appSynSeq + 1}] ${VPN_ADDRESS}:${srcPort} ← $dstIp:$dstPort")
+                Log.i(TAG, "TCP STATE  [${VPN_ADDRESS}:${srcPort} ↔ $dstIp:$dstPort] localSeq=${state.localSeq} remoteSeq=${state.remoteSeq} → waiting for ACK")
 
             } catch (e: Exception) {
                 Log.e(TAG, "TCP connect failed: $srcPort → $dstIp:$dstPort", e)
@@ -357,6 +374,7 @@ class CaptureVpnService : VpnService() {
                         tunOut.write(rst)
                         tunOut.flush()
                     }
+                    Log.i(TAG, "TCP RST    [${VPN_ADDRESS}:${srcPort} ← $dstIp:$dstPort] (connect failed)")
                 } catch (_: Exception) {}
             }
         }
@@ -373,6 +391,7 @@ class CaptureVpnService : VpnService() {
 
         scope.launch {
             val buffer = ByteArray(MTU)
+            Log.i(TAG, "TCP READER [${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] started, localSeq=${state.localSeq} remoteSeq=${state.remoteSeq}")
             try {
                 val input = state.socket.getInputStream()
                 while (isCapturing && state.socket.isConnected && !state.socket.isClosed) {
@@ -382,7 +401,6 @@ class CaptureVpnService : VpnService() {
                     val data = buffer.copyOf(read)
 
                     // Build response packet: src = real server, dst = app
-                    // localSeq tracks the sequence number WE (proxy) are sending
                     val responsePacket = buildTcpPacket(
                         srcIp = state.remoteIp, srcPort = state.remotePort,
                         dstIp = VPN_ADDRESS, dstPort = state.localPort,
@@ -391,6 +409,8 @@ class CaptureVpnService : VpnService() {
                         flags = 0x18,  // PSH+ACK
                         payload = data
                     )
+
+                    Log.i(TAG, "TCP DATA   [${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] flags=PSH+ACK seq=${state.localSeq} ack=${state.remoteSeq} payload=${data.size}B localSeq=${state.localSeq} → ${state.localSeq + data.size}")
 
                     // Advance localSeq by the amount of data we sent
                     state.localSeq += data.size
@@ -436,9 +456,10 @@ class CaptureVpnService : VpnService() {
                 tunOut.write(finAck)
                 tunOut.flush()
             }
+            // FIN consumes 1 sequence number
+            state.localSeq += 1
+            Log.i(TAG, "TCP FIN-ACK[${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] seq=${state.localSeq - 1} ack=${state.remoteSeq + 1} localSeq=${state.localSeq} remoteSeq=${state.remoteSeq + 1}")
         } catch (_: Exception) {}
-
-        Log.d(TAG, "TCP closed (app-initiated): $srcPort")
     }
 
     /**
@@ -463,6 +484,9 @@ class CaptureVpnService : VpnService() {
                     tunOut.write(fin)
                     tunOut.flush()
                 }
+                // FIN consumes 1 sequence number
+                state.localSeq += 1
+                Log.i(TAG, "TCP FIN    [${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] seq=${state.localSeq - 1} ack=${state.remoteSeq} localSeq=${state.localSeq}")
             } catch (_: Exception) {}
         }
     }
