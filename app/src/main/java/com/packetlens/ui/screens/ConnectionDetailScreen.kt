@@ -1,22 +1,30 @@
 package com.packetlens.ui.screens
 
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
-import androidx.compose.ui.platform.LocalContext
 import androidx.activity.ComponentActivity
 import com.packetlens.model.CapturedPacket
 import com.packetlens.ui.viewmodel.CaptureViewModel
+import java.text.SimpleDateFormat
+import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -50,7 +58,7 @@ fun ConnectionDetailScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues),
-                contentAlignment = androidx.compose.ui.Alignment.Center
+                contentAlignment = Alignment.Center
             ) {
                 Text("Packet not found", color = MaterialTheme.colorScheme.error)
             }
@@ -63,15 +71,16 @@ fun ConnectionDetailScreen(
                 .padding(paddingValues)
                 .verticalScroll(rememberScrollState())
         ) {
+            // Application section (at top)
+            ApplicationSection(packet)
+
             // Overview section
             DetailSection(title = "📋 Overview") {
                 DetailRow("Protocol", packet.protocol.name)
-                DetailRow("App", packet.appName.ifEmpty { packet.packageName.ifEmpty { "System" } })
-                DetailRow("Package", packet.packageName)
                 DetailRow("Source", "${packet.srcIp}:${packet.srcPort}")
                 DetailRow("Destination", "${packet.dstIp}:${packet.dstPort}")
                 DetailRow("Direction", packet.direction.name)
-                DetailRow("Size", "${packet.length} bytes")
+                DetailRow("Size", formatBytes(packet.length.toLong()))
             }
 
             // HTTP section
@@ -130,6 +139,7 @@ fun ConnectionDetailScreen(
 
             // Timing section
             DetailSection(title = "⏱️ Timing") {
+                DetailRow("Timestamp", formatTimestamp(packet.timestamp))
                 DetailRow("Connect", "${packet.connectTimeMs}ms")
                 DetailRow("Total", "${packet.totalTimeMs}ms")
             }
@@ -148,6 +158,87 @@ fun ConnectionDetailScreen(
             }
 
             Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun ApplicationSection(packet: CapturedPacket) {
+    val context = LocalContext.current
+    val appIcon = remember(packet.packageName) {
+        if (packet.packageName.isNotEmpty()) {
+            try {
+                val appInfo = context.packageManager.getApplicationInfo(packet.packageName, 0)
+                val icon = context.packageManager.getApplicationIcon(appInfo)
+                val bitmap = BitmapFactory.decodeResource(context.resources, appInfo.icon)
+                bitmap?.asImageBitmap()
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // App icon
+            if (appIcon != null) {
+                Image(
+                    bitmap = appIcon,
+                    contentDescription = packet.appName,
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = packet.appName.take(1).uppercase(),
+                        style = MaterialTheme.typography.headlineMedium
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            // App info
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = packet.appName.ifEmpty { "Unknown Application" },
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = packet.packageName.ifEmpty { "N/A" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "UID: ${if (packet.appId >= 0) packet.appId.toString() else "N/A"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }
@@ -199,4 +290,18 @@ private fun DetailRow(label: String, value: String) {
             modifier = Modifier.weight(1f)
         )
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    return when {
+        bytes < 1024 -> "${bytes}B"
+        bytes < 1024 * 1024 -> "%.1fKB".format(bytes / 1024.0)
+        bytes < 1024 * 1024 * 1024 -> "%.1fMB".format(bytes / (1024.0 * 1024))
+        else -> "%.1fGB".format(bytes / (1024.0 * 1024 * 1024))
+    }
+}
+
+private fun formatTimestamp(timestamp: Long): String {
+    val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    return sdf.format(Date(timestamp))
 }

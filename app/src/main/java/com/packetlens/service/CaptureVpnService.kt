@@ -905,6 +905,10 @@ class CaptureVpnService : VpnService() {
             }
         }
 
+        // Resolve app identity from source port
+        val uid = appResolver.resolvePortToUid(tcpHeader.srcPort)
+        val appInfo = if (uid >= 0) appResolver.resolve(uid) else null
+
         scope.launch {
             _packets.emit(CapturedPacket(
                 protocol = protocol,
@@ -912,6 +916,9 @@ class CaptureVpnService : VpnService() {
                 srcPort = tcpHeader.srcPort, dstPort = tcpHeader.dstPort,
                 length = ipHeader.totalLength,
                 direction = Direction.OUTGOING,
+                appId = uid,
+                appName = appInfo?.appName ?: "",
+                packageName = appInfo?.packageName ?: "",
                 httpMethod = httpMethod, httpHost = httpHost, httpPath = httpPath,
                 tlsSni = tlsSni,
                 dnsQuery = dnsQuery, dnsType = dnsType,
@@ -941,6 +948,10 @@ class CaptureVpnService : VpnService() {
             payloadPreview = "[${payloadSize} bytes UDP] Port ${udpHeader.srcPort}→${udpHeader.dstPort}"
         }
 
+        // Resolve app identity from source port
+        val uid = appResolver.resolvePortToUid(udpHeader.srcPort)
+        val appInfo = if (uid >= 0) appResolver.resolve(uid) else null
+
         scope.launch {
             _packets.emit(CapturedPacket(
                 protocol = protocol,
@@ -948,6 +959,9 @@ class CaptureVpnService : VpnService() {
                 srcPort = udpHeader.srcPort, dstPort = udpHeader.dstPort,
                 length = ipHeader.totalLength,
                 direction = Direction.OUTGOING,
+                appId = uid,
+                appName = appInfo?.appName ?: "",
+                packageName = appInfo?.packageName ?: "",
                 dnsQuery = dnsQuery, dnsType = dnsType,
                 payloadPreview = payloadPreview
             ))

@@ -1,5 +1,7 @@
 package com.packetlens.ui.components
 
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -7,10 +9,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,6 +64,25 @@ fun PacketRow(
     val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
     val timeStr = timeFormat.format(Date(packet.timestamp))
 
+    // Load app icon if packageName is available
+    val context = LocalContext.current
+    val appIcon = remember(packet.packageName) {
+        if (packet.packageName.isNotEmpty()) {
+            try {
+                val iconRes = context.packageManager.getApplicationIcon(packet.packageName)
+                val bitmap = BitmapFactory.decodeResource(context.resources, 
+                    iconRes?.let { 
+                        // Get the resource ID from the icon
+                        val appInfo = context.packageManager.getApplicationInfo(packet.packageName, 0)
+                        appInfo.icon
+                    } ?: 0)
+                bitmap?.asImageBitmap()
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+    }
+
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -76,50 +100,79 @@ fun PacketRow(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Protocol badge
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(protocolColor.copy(alpha = 0.15f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = protocolLabel,
-                    color = protocolColor,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold
+            // App Icon or Protocol Badge
+            if (appIcon != null) {
+                Image(
+                    bitmap = appIcon,
+                    contentDescription = packet.appName,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(8.dp))
                 )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(protocolColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = protocolLabel,
+                        color = protocolColor,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.width(12.dp))
 
             // Connection info
             Column(modifier = Modifier.weight(1f)) {
-                // Top line: Host/URL + Status icon
+                // Top line: App name (if available) or Host
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = statusIcon,
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(end = 4.dp)
-                    )
-                    Text(
-                        text = packet.httpHost ?: packet.tlsSni ?: packet.dnsQuery
-                                ?: "${packet.dstIp}:${packet.dstPort}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
+                    if (packet.appName.isNotEmpty()) {
+                        Text(
+                            text = packet.appName,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    } else {
+                        Text(
+                            text = statusIcon,
+                            fontSize = 14.sp,
+                            modifier = Modifier.padding(end = 4.dp)
+                        )
+                        Text(
+                            text = packet.httpHost ?: packet.tlsSni ?: packet.dnsQuery
+                                    ?: "${packet.dstIp}:${packet.dstPort}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(2.dp))
 
-                // Bottom line: App name + Method + Path
+                // Bottom line: Host + Protocol + Direction
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = packet.appName.ifEmpty { packet.packageName.ifEmpty { "System" } },
+                        text = "$protocolLabel ",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold,
+                        color = protocolColor
+                    )
+                    
+                    Text(
+                        text = packet.httpHost ?: packet.tlsSni ?: packet.dnsQuery
+                                ?: "${packet.dstIp}:${packet.dstPort}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,

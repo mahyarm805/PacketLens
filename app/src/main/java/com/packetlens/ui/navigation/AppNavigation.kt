@@ -7,10 +7,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
-import androidx.hilt.navigation.compose.hiltViewModel
+import com.packetlens.ui.screens.AppSelectorScreen
 import com.packetlens.ui.screens.ConnectionDetailScreen
 import com.packetlens.ui.screens.HomeScreen
 import com.packetlens.ui.viewmodel.CaptureViewModel
+import androidx.hilt.navigation.compose.hiltViewModel
 
 @Composable
 fun AppNavigation() {
@@ -24,6 +25,9 @@ fun AppNavigation() {
                 viewModel = viewModel,
                 onPacketClick = { packetId ->
                     navController.navigate("detail/$packetId")
+                },
+                onAppFilterClick = {
+                    navController.navigate("apps")
                 }
             )
         }
@@ -38,6 +42,14 @@ fun AppNavigation() {
                 packetId = packetId,
                 onBack = { navController.popBackStack() },
                 viewModel = viewModel
+            )
+        }
+        composable("apps") {
+            val homeEntry = remember { navController.getBackStackEntry("home") }
+            val viewModel: CaptureViewModel = hiltViewModel(homeEntry)
+            AppSelectorScreen(
+                viewModel = viewModel,
+                onBack = { navController.popBackStack() }
             )
         }
     }

@@ -2,27 +2,29 @@ package com.packetlens.capture
 
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
-import android.os.Build
+import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import java.net.InetAddress
-import java.net.NetworkInterface
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Resolves UID to package name for app attribution.
  * Maps network packets to the app that generated them.
+ *
+ * Uses /proc/net/tcp to map (srcPort) → UID, then UID → package info.
  */
 class AppResolver(private val context: Context) {
 
     private val pm: PackageManager = context.packageManager
     private val uidCache = ConcurrentHashMap<Int, AppInfo>()
+    private val portUidCache = ConcurrentHashMap<Int, Int>()  // port → uid
 
     data class AppInfo(
         val uid: Int,
         val packageName: String,
         val appName: String,
-        val icon: Int = 0
+        val iconResId: Int = 0
     )
 
     /**
@@ -50,6 +52,76 @@ class AppResolver(private val context: Context) {
         return info
     }
 
+    /**
+     * Resolve a source port to a UID by reading /proc/net/tcp.
+     * The local_port field in /proc/net/tcp matches the app's ephemeral port.
+     *
+     * Format of /proc/net/tcp:
+     *   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+     *   0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345
+     *
+     * local_address is hex: hex_ip:hex_port
+     */
+    fun resolvePortToUid(srcPort: Int): Int {
+        portUidCache[srcPort]?.let { return it }
+
+        try {
+            java.io.File("/proc/net/tcp").bufferedReader().useLines { lines ->
+                for (line in lines) {
+                    if (!line.contains(":")) continue
+                    val parts = line.trim().split("\\s+".toRegex())
+                    if (parts.size < 8) continue
+
+                    val localAddr = parts[1]
+                    val colonIdx = localAddr.lastIndexOf(':')
+                    if (colonIdx < 0) continue
+
+                    val portHex = localAddr.substring(colonIdx + 1)
+                    val port = portHex.toIntOrNull(16) ?: continue
+
+                    if (port == srcPort) {
+                        val uid = parts[7].toIntOrNull() ?: 0
+                        portUidCache[srcPort] = uid
+                        return uid
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Also check /proc/net/tcp6 for IPv6 connections
+        try {
+            java.io.File("/proc/net/tcp6").bufferedReader().useLines { lines ->
+                for (line in lines) {
+                    if (!line.contains(":")) continue
+                    val parts = line.trim().split("\\s+".toRegex())
+                    if (parts.size < 8) continue
+
+                    val localAddr = parts[1]
+                    val colonIdx = localAddr.lastIndexOf(':')
+                    if (colonIdx < 0) continue
+
+                    val portHex = localAddr.substring(colonIdx + 1)
+                    val port = portHex.toIntOrNull(16) ?: continue
+
+                    if (port == srcPort) {
+                        val uid = parts[7].toIntOrNull() ?: 0
+                        portUidCache[srcPort] = uid
+                        return uid
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return -1
+    }
+
+    /**
+     * Clear port cache (call periodically or on capture restart).
+     */
+    fun clearPortCache() {
+        portUidCache.clear()
+    }
+
     private fun resolveSystemApp(uid: Int): AppInfo {
         return when (uid) {
             0 -> AppInfo(uid, "android", "Android System")
@@ -74,7 +146,6 @@ class AppResolver(private val context: Context) {
      * Check if a connection is going through the VPN tunnel.
      */
     fun isVpnConnection(srcIp: String, dstIp: String): Boolean {
-        // Traffic to/from the TUN interface
         return srcIp.startsWith("10.0.0.") || dstIp.startsWith("10.0.0.")
     }
 
@@ -93,7 +164,7 @@ class AppResolver(private val context: Context) {
                     uid = info.activityInfo.applicationInfo.uid,
                     packageName = info.activityInfo.packageName,
                     appName = info.loadLabel(pm).toString(),
-                    icon = info.activityInfo.applicationInfo.icon
+                    iconResId = info.activityInfo.applicationInfo.icon
                 )
             )
         }

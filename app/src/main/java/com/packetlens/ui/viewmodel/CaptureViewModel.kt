@@ -35,8 +35,19 @@ class CaptureViewModel @Inject constructor(
     private val _stats = MutableStateFlow(Stats())
     val stats: StateFlow<Stats> = _stats.asStateFlow()
 
+    // App filter state
+    private val _appFilterMode = MutableStateFlow(AppFilterMode.ALL)
+    val appFilterMode: StateFlow<AppFilterMode> = _appFilterMode.asStateFlow()
+
+    private val _selectedApps = MutableStateFlow<Set<String>>(emptySet())
+    val selectedApps: StateFlow<Set<String>> = _selectedApps.asStateFlow()
+
     private val allPackets = mutableListOf<CapturedPacket>()
     private var packetIdCounter = 0L
+
+    // Available apps for filter (cached)
+    private val _availableApps = MutableStateFlow<List<AppResolver.AppInfo>>(emptyList())
+    val availableApps: StateFlow<List<AppResolver.AppInfo>> = _availableApps.asStateFlow()
 
     init {
         // Listen for packets from VPNService
@@ -58,9 +69,13 @@ class CaptureViewModel @Inject constructor(
                 _isCapturing.value = running
             }
         }
+
+        // Load available apps
+        loadAvailableApps()
     }
 
     fun startCapture() {
+        appResolver.clearPortCache()
         val intent = Intent(app, CaptureVpnService::class.java).setAction("START")
         app.startForegroundService(intent)
     }
@@ -98,17 +113,70 @@ class CaptureViewModel @Inject constructor(
         _stats.value = Stats()
     }
 
+    // App filter functions
+    fun setAppFilterMode(mode: AppFilterMode) {
+        _appFilterMode.value = mode
+        if (mode == AppFilterMode.ALL) {
+            _selectedApps.value = emptySet()
+        }
+        applyFilter()
+    }
+
+    fun toggleAppFilter(packageName: String) {
+        val current = _selectedApps.value.toMutableSet()
+        if (current.contains(packageName)) {
+            current.remove(packageName)
+        } else {
+            current.add(packageName)
+        }
+        _selectedApps.value = current
+        applyFilter()
+    }
+
+    fun setSelectedApps(apps: Set<String>) {
+        _selectedApps.value = apps
+        applyFilter()
+    }
+
+    fun clearAppFilter() {
+        _selectedApps.value = emptySet()
+        _appFilterMode.value = AppFilterMode.ALL
+        applyFilter()
+    }
+
+    private fun loadAvailableApps() {
+        viewModelScope.launch {
+            val apps = appResolver.getAllInstalledApps()
+            _availableApps.value = apps
+        }
+    }
+
     private fun applyFilter() {
-        val currentFilter = _filter.value
-        _packets.value = when (currentFilter) {
-            ProtocolFilter.ALL -> allPackets.toList()
-            ProtocolFilter.HTTP -> allPackets.filter {
-                it.protocol == Protocol.HTTP || it.protocol == Protocol.HTTPS
+        val protocolFilter = _filter.value
+        val appMode = _appFilterMode.value
+        val selectedApps = _selectedApps.value
+
+        _packets.value = allPackets.filter { packet ->
+            // Protocol filter
+            val protocolMatch = when (protocolFilter) {
+                ProtocolFilter.ALL -> true
+                ProtocolFilter.HTTP -> packet.protocol == Protocol.HTTP || packet.protocol == Protocol.HTTPS
+                ProtocolFilter.DNS -> packet.protocol == Protocol.DNS
+                ProtocolFilter.TLS -> packet.protocol == Protocol.TLS
+                ProtocolFilter.TCP -> packet.protocol == Protocol.TCP
+                ProtocolFilter.UDP -> packet.protocol == Protocol.UDP
             }
-            ProtocolFilter.DNS -> allPackets.filter { it.protocol == Protocol.DNS }
-            ProtocolFilter.TLS -> allPackets.filter { it.protocol == Protocol.TLS }
-            ProtocolFilter.TCP -> allPackets.filter { it.protocol == Protocol.TCP }
-            ProtocolFilter.UDP -> allPackets.filter { it.protocol == Protocol.UDP }
+
+            // App filter
+            val appMatch = when (appMode) {
+                AppFilterMode.ALL -> true
+                AppFilterMode.SELECTED -> {
+                    if (selectedApps.isEmpty()) true
+                    else packet.packageName in selectedApps
+                }
+            }
+
+            protocolMatch && appMatch
         }
     }
 
@@ -132,5 +200,9 @@ class CaptureViewModel @Inject constructor(
 
     enum class ProtocolFilter {
         ALL, HTTP, DNS, TLS, TCP, UDP
+    }
+
+    enum class AppFilterMode {
+        ALL, SELECTED
     }
 }

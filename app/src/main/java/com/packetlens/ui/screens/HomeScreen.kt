@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,12 +29,15 @@ import com.packetlens.ui.viewmodel.CaptureViewModel
 @Composable
 fun HomeScreen(
     viewModel: CaptureViewModel,
-    onPacketClick: (Long) -> Unit
+    onPacketClick: (Long) -> Unit,
+    onAppFilterClick: () -> Unit
 ) {
     val packets by viewModel.packets.collectAsState()
     val isCapturing by viewModel.isCapturing.collectAsState()
     val filter by viewModel.filter.collectAsState()
     val stats by viewModel.stats.collectAsState()
+    val appFilterMode by viewModel.appFilterMode.collectAsState()
+    val selectedApps by viewModel.selectedApps.collectAsState()
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -60,6 +64,20 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    // App filter button
+                    if (isCapturing) {
+                        IconButton(onClick = onAppFilterClick) {
+                            Icon(
+                                Icons.Default.FilterList,
+                                contentDescription = "App Filter",
+                                tint = if (appFilterMode == CaptureViewModel.AppFilterMode.SELECTED) 
+                                    MaterialTheme.colorScheme.primary 
+                                else 
+                                    MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+
                     // Start/Stop button
                     val buttonColor by animateColorAsState(
                         if (isCapturing) Color(0xFFF44336) else Color(0xFF4CAF50),
@@ -108,6 +126,44 @@ fun HomeScreen(
         ) {
             // Stats bar
             StatsBar(stats)
+
+            // Active app filter indicator
+            if (appFilterMode == CaptureViewModel.AppFilterMode.SELECTED && selectedApps.isNotEmpty()) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.FilterList,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Filtering ${selectedApps.size} app(s)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        TextButton(
+                            onClick = { viewModel.clearAppFilter() }
+                        ) {
+                            Text("Clear", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
 
             // Filter chips
             FilterChips(filter) { viewModel.setFilter(it) }
