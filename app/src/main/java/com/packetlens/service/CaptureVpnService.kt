@@ -400,41 +400,61 @@ class CaptureVpnService : VpnService() {
      * Start a coroutine that reads data from the protected real socket
      * and writes properly-addressed IP packets back into the TUN.
      *
+     * CRITICAL: We must split large reads into segments that fit within MTU.
+     * MTU = 1500, IP header = 20, TCP header = 20 → max payload = 1460 bytes.
+     * If the socket returns more than 1460 bytes, we split into multiple segments,
+     * each with correct TCP sequence numbers.
+     *
      * Only one reader coroutine is launched per srcPort.
      */
     private fun ensureTcpReader(srcPort: Int, state: TcpConnectionState, tunOut: FileOutputStream) {
         if (!activeTcpReaders.add(srcPort)) return // already running
 
         scope.launch {
-            val buffer = ByteArray(MTU)
+            // Read buffer — may receive up to MTU bytes from socket
+            val readBuffer = ByteArray(MTU)
+            val MAX_TCP_PAYLOAD = MTU - 20 - 20  // 1460 bytes
             Log.i(TAG, "TCP READER [${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] started, localSeq=${state.localSeq} remoteSeq=${state.remoteSeq}")
             try {
                 val input = state.socket.getInputStream()
                 while (isCapturing && state.socket.isConnected && !state.socket.isClosed) {
-                    val read = input.read(buffer)
+                    val read = input.read(readBuffer)
                     if (read <= 0) break
 
-                    val data = buffer.copyOf(read)
+                    val totalPayload = read
+                    val data = readBuffer.copyOf(totalPayload)
 
-                    // Build response packet: src = real server, dst = app
-                    val responsePacket = buildTcpPacket(
-                        srcIp = state.remoteIp, srcPort = state.remotePort,
-                        dstIp = VPN_ADDRESS, dstPort = state.localPort,
-                        seqNum = state.localSeq,
-                        ackNum = state.remoteSeq,
-                        flags = 0x18,  // PSH+ACK
-                        payload = data
-                    )
+                    // Split into MTU-sized segments
+                    var offset = 0
+                    var segmentIndex = 0
+                    val seqStart = state.localSeq
 
-                    Log.i(TAG, "TCP DATA   [${VPN_ADDRESS}:${srcPort} ← ${state.remoteIp}:${state.remotePort}] flags=PSH+ACK seq=${state.localSeq} ack=${state.remoteSeq} payload=${data.size}B localSeq=${state.localSeq} → ${state.localSeq + data.size}")
+                    while (offset < totalPayload) {
+                        val chunkSize = minOf(MAX_TCP_PAYLOAD, totalPayload - offset)
+                        val chunk = data.copyOfRange(offset, offset + chunkSize)
 
-                    // Advance localSeq by the amount of data we sent
-                    state.localSeq += data.size
+                        // Build response packet: src = real server, dst = app
+                        val responsePacket = buildTcpPacket(
+                            srcIp = state.remoteIp, srcPort = state.remotePort,
+                            dstIp = VPN_ADDRESS, dstPort = state.localPort,
+                            seqNum = state.localSeq,
+                            ackNum = state.remoteSeq,
+                            flags = 0x18,  // PSH+ACK
+                            payload = chunk
+                        )
 
-                    synchronized(tunOut) {
-                        tunOut.write(responsePacket)
-                        tunOut.flush()
+                        synchronized(tunOut) {
+                            tunOut.write(responsePacket)
+                            tunOut.flush()
+                        }
+
+                        state.localSeq += chunkSize
+                        offset += chunkSize
+                        segmentIndex++
                     }
+
+                    pktsFwdTcp++
+                    Log.i(TAG, "TCP_RESPONSE readBytes=$totalPayload segments=$segmentIndex totalPayload=$totalPayload seqStart=$seqStart seqEnd=${state.localSeq}")
                 }
             } catch (e: Exception) {
                 if (isCapturing) Log.d(TAG, "TCP reader closed: $srcPort — ${e.message}")
